@@ -56,7 +56,7 @@ MONTH_TH = {
     7:"ก.ค.",8:"ส.ค.",9:"ก.ย.",10:"ต.ค.",11:"พ.ย.",12:"ธ.ค."
 }
 
-# ─── Excel Parser ─────────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 def _safe_num(val) -> float:
     try:
         v = float(val)
@@ -65,16 +65,156 @@ def _safe_num(val) -> float:
         return 0.0
 
 
-def _parse_pivot_format(file_bytes: bytes) -> pd.DataFrame:
-    """
-    Parse Pivot Table format (ต้นฉบับ):
-      Row 0: unit header
-      Row 1: column labels
-      Data:  ยอดขาย ตลาด X → month number → date rows
-    """
-    raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
+def _thai_date_to_gregorian(date_str: str):
+    """แปลง DD/MM/BBBB (พ.ศ.) → datetime  เช่น 3/3/2568 → 2025-03-03"""
+    s = str(date_str).strip()
+    if not s or s in ("nan","0:00:00",""):
+        return None
+    # กรณีเป็น timestamp จาก Excel (float / int)
+    try:
+        f = float(s)
+        if 40000 < f < 60000:          # Excel serial date range
+            return pd.Timestamp("1899-12-30") + pd.Timedelta(days=int(f))
+    except Exception:
+        pass
+    parts = s.split("/")
+    if len(parts) != 3:
+        return None
+    try:
+        d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
+        if y > 2400:                   # พ.ศ. → ค.ศ.
+            y -= 543
+        if y < 1900 or y > 2100:
+            return None
+        return pd.Timestamp(year=y, month=m, day=d)
+    except Exception:
+        return None
 
-    # หา header row
+
+# ─── CSV Parser (รายวัน format ใหม่) ─────────────────────────────────────────
+def _parse_csv_daily(file_bytes: bytes) -> pd.DataFrame:
+    """
+    รองรับ CSV format รายวัน:
+      หัว: unit :ถัง,4,7,15,16,48   (row แรก คือ header บอก unit)
+      ข้อมูล: DD/MM/BBBB,kg4,kg7,kg15,,kg48
+
+    ไฟล์นี้ไม่มีคอลัมน์ตลาด — ข้อมูลทุกแถวถือเป็น "ตลาดรวม"
+    แต่ถ้าไฟล์มีหลายกลุ่ม (แยกด้วย blank row หรือ header ซ้ำ) จะ detect อัตโนมัติ
+    """
+    text = file_bytes.decode("utf-8", errors="replace")
+    lines = [l.strip() for l in text.splitlines()]
+
+    # หา column layout จาก header row แรก
+    # "unit :ถัง,4,7,15,16,48"  →  cols[1:] = [4,7,15,16,48]
+    header_line = lines[0] if lines else ""
+    header_parts = [p.strip() for p in header_line.split(",")]
+    # สร้าง column names จาก header (ข้ามคอลัมน์แรกที่เป็น label)
+    size_cols = []
+    for p in header_parts[1:]:
+        try:
+            size_cols.append(f"kg{int(float(p))}")
+        except Exception:
+            size_cols.append(p if p else "skip")
+
+    records = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        date = _thai_date_to_gregorian(parts[0])
+        if date is None:
+            continue
+        row = {"date": date}
+        for i, col in enumerate(size_cols):
+            idx = i + 1
+            if idx < len(parts) and col not in ("skip",):
+                row[col] = _safe_num(parts[idx])
+        records.append(row)
+
+    if not records:
+        raise ValueError("ไม่พบข้อมูลวันที่ที่ถูกต้องในไฟล์ CSV")
+
+    df = pd.DataFrame(records)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    df["month"] = df["month"] = df["date"].dt.month
+
+    # ตรวจสอบคอลัมน์ที่ต้องการ
+    for col in ["kg4","kg7","kg15","kg48"]:
+        if col not in df.columns:
+            df[col] = 0.0
+
+    # รวมเป็นรายเดือน — ไม่มีข้อมูลตลาด ใส่ "ตลาดรวม"
+    agg = df.groupby("month")[["kg4","kg7","kg15","kg48"]].sum().reset_index()
+    agg["market"] = "ตลาดรวม"
+    agg["month_name"] = agg["month"].map(MONTH_TH)
+    return agg
+
+
+def _parse_csv_daily_with_market(file_bytes: bytes) -> pd.DataFrame:
+    """
+    รองรับ CSV ที่มีคอลัมน์ market ชัดเจน:
+      date,market,kg4,kg7,kg15,kg48
+    """
+    df = pd.read_csv(io.BytesIO(file_bytes), encoding="utf-8-sig")
+    df.columns = [c.strip() for c in df.columns]
+
+    # Map columns
+    col_map = {}
+    for c in df.columns:
+        cl = c.lower()
+        if any(k in cl for k in ["date","วันที่","วัน"]):
+            col_map[c] = "date"
+        elif any(k in cl for k in ["market","ตลาด","สาขา"]):
+            col_map[c] = "market"
+        elif "4" in cl:  col_map[c] = "kg4"
+        elif "7" in cl:  col_map[c] = "kg7"
+        elif "15" in cl: col_map[c] = "kg15"
+        elif "48" in cl: col_map[c] = "kg48"
+    df = df.rename(columns=col_map)
+
+    if "date" not in df.columns:
+        raise ValueError("ไม่พบคอลัมน์ date ใน CSV")
+
+    df["date"] = df["date"].astype(str).apply(_thai_date_to_gregorian)
+    df = df.dropna(subset=["date"])
+    df["month"] = df["date"].apply(lambda d: d.month)
+
+    if "market" not in df.columns:
+        df["market"] = "ตลาดรวม"
+
+    for col in ["kg4","kg7","kg15","kg48"]:
+        if col not in df.columns:
+            df[col] = 0
+
+    agg = df.groupby(["month","market"])[["kg4","kg7","kg15","kg48"]].sum().reset_index()
+    agg["month_name"] = agg["month"].map(MONTH_TH)
+    return agg
+
+
+def parse_csv(file) -> tuple:
+    """Auto-detect CSV format และ parse"""
+    file_bytes = file.read()
+    text_preview = file_bytes[:500].decode("utf-8", errors="replace")
+
+    # ถ้า header มี "unit" หรือ "ถัง" → format รายวัน ไม่มีตลาด
+    if "unit" in text_preview.lower() or "ถัง" in text_preview:
+        return _parse_csv_daily(file_bytes), "CSV รายวัน (auto-detect ตลาดรวม)"
+
+    # ถ้ามีคำว่า market / ตลาด ใน header
+    first_line = text_preview.split("\n")[0].lower()
+    if any(k in first_line for k in ["market","ตลาด","สาขา"]):
+        return _parse_csv_daily_with_market(file_bytes), "CSV รายวัน (มีคอลัมน์ตลาด)"
+
+    # Default: ลอง parse แบบ daily ไม่มีตลาด
+    return _parse_csv_daily(file_bytes), "CSV รายวัน"
+
+
+# ─── Excel Parsers (เดิม) ──────────────────────────────────────────────────────
+def _parse_pivot_format(file_bytes: bytes) -> pd.DataFrame:
+    raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
     header_row = None
     for i, row in raw.iterrows():
         row_str = " ".join(str(v) for v in row.values).lower()
@@ -82,15 +222,12 @@ def _parse_pivot_format(file_bytes: bytes) -> pd.DataFrame:
             header_row = i
             break
     if header_row is None:
-        raise ValueError("ไม่พบ header ใน Pivot format (ต้องมี 'Row Labels' หรือ 'Sum of')")
+        raise ValueError("ไม่พบ header ใน Pivot format")
 
     data_raw = raw.iloc[header_row + 1:].reset_index(drop=True)
-    # col positions: 0=label, 1=kg4, 2=kg7, 3=kg15, 4=kg15_buy, 5=kg48
     size_col_map = {"kg4": 1, "kg7": 2, "kg15": 3, "kg48": 5}
-
     records = []
     current_market = None
-    current_month = None
 
     for _, row in data_raw.iterrows():
         label = str(row.iloc[0]).strip()
@@ -98,18 +235,16 @@ def _parse_pivot_format(file_bytes: bytes) -> pd.DataFrame:
             continue
         if "ยอดขาย ตลาด" in label:
             current_market = label.replace("ยอดขาย ", "").strip()
-            current_month = None
             continue
         if "หน้าร้าน" in label:
             current_market = None
             continue
         if label.isdigit() and 1 <= int(label) <= 12:
-            current_month = int(label)
             if current_market:
                 try:
                     records.append({
                         "market": current_market,
-                        "month":  current_month,
+                        "month":  int(label),
                         "kg4":   _safe_num(row.iloc[size_col_map["kg4"]]),
                         "kg7":   _safe_num(row.iloc[size_col_map["kg7"]]),
                         "kg15":  _safe_num(row.iloc[size_col_map["kg15"]]),
@@ -117,10 +252,9 @@ def _parse_pivot_format(file_bytes: bytes) -> pd.DataFrame:
                     })
                 except Exception:
                     pass
-            continue
 
     if not records:
-        raise ValueError("ไม่พบข้อมูลตลาดในไฟล์ กรุณาตรวจสอบ format")
+        raise ValueError("ไม่พบข้อมูลตลาดในไฟล์")
 
     result = pd.DataFrame(records)
     result["month_name"] = result["month"].map(MONTH_TH)
@@ -128,56 +262,28 @@ def _parse_pivot_format(file_bytes: bytes) -> pd.DataFrame:
 
 
 def _parse_flat_format(file_bytes: bytes) -> pd.DataFrame:
-    """
-    Flat format: columns date | market | kg4 | kg7 | kg15 | kg48
-    หรือ Long:   columns date | market | size | quantity
-    """
     df = pd.read_excel(io.BytesIO(file_bytes))
     df.columns = [str(c).strip().lower().replace(" ", "").replace("_", "") for c in df.columns]
-
     col_map = {}
     for c in df.columns:
-        if any(k in c for k in ["date","วันที่","วัน"]):
-            col_map[c] = "date"
-        elif any(k in c for k in ["market","ตลาด","สาขา"]):
-            col_map[c] = "market"
-        elif "4" in c and "kg" in c:
-            col_map[c] = "kg4"
-        elif "7" in c and "kg" in c:
-            col_map[c] = "kg7"
-        elif "15" in c and "kg" in c:
-            col_map[c] = "kg15"
-        elif "48" in c and "kg" in c:
-            col_map[c] = "kg48"
-        elif any(k in c for k in ["size","ขนาด"]):
-            col_map[c] = "size"
-        elif any(k in c for k in ["qty","quantity","จำนวน","ยอด"]):
-            col_map[c] = "quantity"
+        if any(k in c for k in ["date","วันที่","วัน"]):         col_map[c] = "date"
+        elif any(k in c for k in ["market","ตลาด","สาขา"]):      col_map[c] = "market"
+        elif "4" in c and "kg" in c:  col_map[c] = "kg4"
+        elif "7" in c and "kg" in c:  col_map[c] = "kg7"
+        elif "15" in c and "kg" in c: col_map[c] = "kg15"
+        elif "48" in c and "kg" in c: col_map[c] = "kg48"
     df = df.rename(columns=col_map)
-
     if "date" not in df.columns:
-        raise ValueError("ไม่พบคอลัมน์วันที่ (date / วันที่)")
-    if "market" not in df.columns:
-        raise ValueError("ไม่พบคอลัมน์ตลาด (market / ตลาด)")
-
+        raise ValueError("ไม่พบคอลัมน์วันที่")
     df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
     df = df.dropna(subset=["date"])
     df["month"] = df["date"].dt.month
-
-    if "size" in df.columns and "quantity" in df.columns:
-        df["size_num"] = df["size"].astype(str).str.extract(r"(\d+)").astype(float)
-        df["size_col"] = "kg" + df["size_num"].astype(int).astype(str)
-        df = df.pivot_table(
-            index=["month", "market"], columns="size_col",
-            values="quantity", aggfunc="sum"
-        ).reset_index()
-        df.columns.name = None
-
-    for col in ["kg4", "kg7", "kg15", "kg48"]:
+    if "market" not in df.columns:
+        df["market"] = "ตลาดรวม"
+    for col in ["kg4","kg7","kg15","kg48"]:
         if col not in df.columns:
             df[col] = 0
-
-    result = df.groupby(["month", "market"])[["kg4", "kg7", "kg15", "kg48"]].sum().reset_index()
+    result = df.groupby(["month","market"])[["kg4","kg7","kg15","kg48"]].sum().reset_index()
     result["month_name"] = result["month"].map(MONTH_TH)
     return result
 
@@ -186,43 +292,47 @@ def parse_excel(file) -> tuple:
     file_bytes = file.read()
     raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
     head_str = raw.iloc[:5].to_string().lower()
-
     if "unit" in head_str or "ถัง" in head_str or "row labels" in head_str:
         return _parse_pivot_format(file_bytes), "Pivot (ต้นฉบับ)"
     return _parse_flat_format(file_bytes), "Flat / Long format"
 
 
-# ─── Sidebar ─────────────────────────────────────────────────────────────────
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⛽ Gas Sales Monitor")
     st.caption("ระบบติดตามยอดขายก๊าซหุงต้ม")
     st.divider()
 
-    st.markdown("### 📂 อัปโหลดข้อมูล Excel")
+    st.markdown("### 📂 อัปโหลดข้อมูล")
     st.markdown('<div class="upload-box">', unsafe_allow_html=True)
 
     uploaded = st.file_uploader(
-        "ลาก Excel มาวางที่นี่ (.xlsx / .xls)",
-        type=["xlsx", "xls"],
+        "ลาก Excel หรือ CSV มาวางที่นี่",
+        type=["xlsx", "xls", "csv"],
         label_visibility="collapsed"
     )
 
     with st.expander("📋 Format ที่รองรับ"):
         st.markdown("""
-**Format 1 — Pivot (ต้นฉบับ)**
-Pivot Table เหมือนไฟล์ที่ให้มา มี:
-- `ยอดขาย ตลาด 1`, `ยอดขาย ตลาด 2` ...
-- Row month เป็นตัวเลข 3–12
+**Format 1 — CSV รายวัน (ใหม่)**
+```
+unit :ถัง,4,7,15,16,48
+3/3/2568,3,7,65,,0
+4/3/2568,5,5,54,,0
+```
+*รองรับวันที่ Thai Buddhist calendar (พ.ศ.)*
 
-**Format 2 — Flat รายวัน**
+**Format 2 — CSV มีตลาด**
+```
+date,market,kg4,kg7,kg15,kg48
+3/3/2568,ตลาด 1,3,7,65,0
+```
+
+**Format 3 — Excel Pivot (ต้นฉบับ)**
+Pivot Table มี ยอดขาย ตลาด 1, 2, 3
+
+**Format 4 — Excel Flat**
 | date | market | kg4 | kg7 | kg15 | kg48 |
-|---|---|---|---|---|---|
-| 1/3/2568 | ตลาด 1 | 5 | 3 | 44 | 0 |
-
-**Format 3 — Long format**
-| date | market | size | quantity |
-|---|---|---|---|
-| 1/3/2568 | ตลาด 1 | 15 kg | 44 |
         """)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -232,7 +342,12 @@ Pivot Table เหมือนไฟล์ที่ให้มา มี:
 
     if uploaded is not None:
         try:
-            df_uploaded, fmt = parse_excel(uploaded)
+            file_name = uploaded.name.lower()
+            if file_name.endswith(".csv"):
+                df_uploaded, fmt = parse_csv(uploaded)
+            else:
+                df_uploaded, fmt = parse_excel(uploaded)
+
             df = df_uploaded
             data_source = f"📄 {uploaded.name} ({fmt})"
             st.success(f"✅ โหลดสำเร็จ — {len(df)} แถว / {df['market'].nunique()} ตลาด")
@@ -241,6 +356,7 @@ Pivot Table เหมือนไฟล์ที่ให้มา มี:
             df = pd.DataFrame(DEFAULT_DATA)
             df["month_name"] = df["month"].map(MONTH_TH)
             st.error(f"❌ {parse_error}")
+            st.info("กำลังใช้ข้อมูลตัวอย่างแทน")
     else:
         df = pd.DataFrame(DEFAULT_DATA)
         df["month_name"] = df["month"].map(MONTH_TH)
@@ -253,7 +369,7 @@ Pivot Table เหมือนไฟล์ที่ให้มา มี:
 
     selected_size = st.selectbox(
         "ขนาดถัง (Primary KPI)",
-        options=["kg15", "kg4", "kg7", "kg48"],
+        options=["kg15","kg4","kg7","kg48"],
         format_func=lambda x: {"kg15":"15 kg","kg4":"4 kg","kg7":"7 kg","kg48":"48 kg"}[x]
     )
     size_label = {"kg15":"15 kg","kg4":"4 kg","kg7":"7 kg","kg48":"48 kg"}[selected_size]
@@ -266,8 +382,17 @@ Pivot Table เหมือนไฟล์ที่ให้มา มี:
         value=(month_min, month_max)
     )
 
+    # ── Before/After toggle ──
+    st.divider()
+    st.markdown("### 🔄 Before / After Analysis")
+    improve_month = st.number_input(
+        "เดือนที่เริ่ม Improve", min_value=1, max_value=12, value=4,
+        help="เม.ย. = 4 (เริ่ม implement zone routing)"
+    )
+
     st.divider()
     st.caption(f"📌 {data_source}")
+
 
 # ─── Filter ───────────────────────────────────────────────────────────────────
 dff = df[
@@ -384,6 +509,58 @@ with col_d:
     )
     st.plotly_chart(fig_mbar, use_container_width=True)
 
+# ─── Before / After Section ───────────────────────────────────────────────────
+st.divider()
+st.markdown(f"#### 🔄 Before vs After — เดือนที่เริ่ม Improve: {MONTH_TH.get(improve_month,'?')} (เดือน {improve_month})")
+
+dff["period"] = dff["month"].apply(
+    lambda m: f"After ({MONTH_TH.get(improve_month,'?')}+)" if m >= improve_month
+    else f"Before (ก่อน {MONTH_TH.get(improve_month,'?')})"
+)
+
+ba_summary = (
+    dff.groupby(["period","market"])[selected_size]
+    .mean().reset_index()
+    .rename(columns={selected_size: "avg_per_month"})
+)
+
+# แสดง metric cards Before vs After
+before_label = f"Before (ก่อน {MONTH_TH.get(improve_month,'?')})"
+after_label  = f"After ({MONTH_TH.get(improve_month,'?')}+)"
+
+before_df = ba_summary[ba_summary["period"] == before_label]
+after_df  = ba_summary[ba_summary["period"] == after_label]
+
+if not before_df.empty and not after_df.empty:
+    ba_cols = st.columns(len(selected_markets))
+    for i, mkt in enumerate(sorted(selected_markets)):
+        b_val = before_df[before_df["market"] == mkt]["avg_per_month"].values
+        a_val = after_df[after_df["market"] == mkt]["avg_per_month"].values
+        if len(b_val) > 0 and len(a_val) > 0:
+            b, a = b_val[0], a_val[0]
+            delta_pct = ((a - b) / b * 100) if b > 0 else 0
+            ba_cols[i].metric(
+                label=mkt,
+                value=f"{a:.0f} ถัง/เดือน",
+                delta=f"{delta_pct:+.1f}% vs before"
+            )
+
+fig_ba = px.bar(
+    ba_summary, x="market", y="avg_per_month", color="period",
+    barmode="group", template="plotly_dark",
+    color_discrete_map={
+        before_label: "#f78166",
+        after_label:  "#3fb950"
+    },
+    labels={"avg_per_month": f"เฉลี่ย {size_label} (ถัง/เดือน)", "market":"ตลาด","period":"ช่วง"}
+)
+fig_ba.update_layout(
+    height=280, margin=dict(l=0,r=0,t=10,b=0),
+    legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="left",x=0),
+    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+)
+st.plotly_chart(fig_ba, use_container_width=True)
+
 # ─── Weekly Heatmap ───────────────────────────────────────────────────────────
 st.divider()
 st.markdown("#### 🗓️ Weekly Schedule Heatmap — คาดการณ์ยอดรายวัน")
@@ -439,14 +616,14 @@ for mname, mdata in heat_df.items():
         })
 
 schedule_df = pd.DataFrame(schedule_rows)
-pivot = schedule_df.pivot_table(
+pivot_sched = schedule_df.pivot_table(
     index="วัน", columns="เดือน", values="คาดการณ์ (ถัง)", aggfunc="first"
 ).reindex(day_order)
 month_order = [MONTH_TH[m] for m in sorted(dff["month"].unique())]
-pivot = pivot[[c for c in month_order if c in pivot.columns]]
+pivot_sched = pivot_sched[[c for c in month_order if c in pivot_sched.columns]]
 
 st.dataframe(
-    pivot.style.background_gradient(cmap="Blues", axis=None),
+    pivot_sched.style.background_gradient(cmap="Blues", axis=None),
     use_container_width=True, height=290
 )
 
@@ -468,14 +645,14 @@ with col_f:
 # ─── Raw Data Preview ─────────────────────────────────────────────────────────
 with st.expander("🔍 ดูข้อมูลดิบ (Raw Data)"):
     st.dataframe(dff.sort_values(["market","month"]), use_container_width=True)
-    csv = dff.to_csv(index=False, encoding="utf-8-sig")
+    csv_out = dff.to_csv(index=False, encoding="utf-8-sig")
     st.download_button(
         "⬇️ ดาวน์โหลด CSV",
-        data=csv.encode("utf-8-sig"),
+        data=csv_out.encode("utf-8-sig"),
         file_name="gas_sales_filtered.csv",
         mime="text/csv"
     )
 
 # ─── Footer ───────────────────────────────────────────────────────────────────
 st.divider()
-st.caption("⛽ Gas Sales Monitor · Streamlit + Plotly · รองรับ Excel Upload (Pivot / Flat / Long format)")
+st.caption("⛽ Gas Sales Monitor · Streamlit + Plotly · รองรับ CSV รายวัน + Excel Pivot/Flat/Long format")
