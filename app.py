@@ -91,125 +91,137 @@ def _thai_date_to_gregorian(date_str: str):
         return None
 
 
-# ─── CSV Parser (รายวัน format ใหม่) ─────────────────────────────────────────
-def _parse_csv_daily(file_bytes: bytes) -> pd.DataFrame:
+# ─── CSV Parser — Pivot-CSV format (LIG) ─────────────────────────────────────
+def _parse_pivot_csv(file_bytes: bytes) -> pd.DataFrame:
     """
-    รองรับ CSV format รายวัน:
-      หัว: unit :ถัง,4,7,15,16,48   (row แรก คือ header บอก unit)
-      ข้อมูล: DD/MM/BBBB,kg4,kg7,kg15,,kg48
-
-    ไฟล์นี้ไม่มีคอลัมน์ตลาด — ข้อมูลทุกแถวถือเป็น "ตลาดรวม"
-    แต่ถ้าไฟล์มีหลายกลุ่ม (แยกด้วย blank row หรือ header ซ้ำ) จะ detect อัตโนมัติ
+    รองรับ CSV ที่ export จาก Pivot Table ของ LIG:
+      Row 0: unit :???,4,7,15,48           (header บอก size)
+      Row 1: Row Labels,Sum of...           (column names — ข้าม)
+      Data:  ?????? ???? 1  (ตลาด 1 — encoding เสีย แต่ลำดับยังถูกต้อง)
+             3                              (เดือน 3)
+             3/3/2568,3,7,65,0             (รายวัน)
+             ...
+             ?????? ???? 2  (ตลาด 2)
+             ...
+    ตลาดระบุจาก pattern "????? ????" ตามด้วยเลข ลำดับ 1,2,3
+    หน้าร้าน ระบุจาก "????????" (8 question marks)
     """
     text = file_bytes.decode("utf-8", errors="replace")
     lines = [l.strip() for l in text.splitlines()]
 
-    # หา column layout จาก header row แรก
-    # "unit :ถัง,4,7,15,16,48"  →  cols[1:] = [4,7,15,16,48]
-    header_line = lines[0] if lines else ""
-    header_parts = [p.strip() for p in header_line.split(",")]
-    # สร้าง column names จาก header (ข้ามคอลัมน์แรกที่เป็น label)
-    size_cols = []
-    for p in header_parts[1:]:
+    def safe_int(v):
+        try: return int(float(v))
+        except: return 0
+
+    def parse_date(s):
+        s = s.strip()
+        if not s or ":" in s or s == "nan": return None
+        parts = s.split("/")
+        if len(parts) != 3: return None
         try:
-            size_cols.append(f"kg{int(float(p))}")
+            d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
+            if y > 2400: y -= 543
+            if 1900 <= y <= 2100: return (y, m, d)
         except Exception:
-            size_cols.append(p if p else "skip")
+            pass
+        return None
 
     records = []
-    for line in lines[1:]:
-        if not line:
-            continue
+    current_market = None
+    current_month  = None
+    market_num     = 0
+
+    for line in lines[2:]:   # ข้าม row 0 (unit) และ row 1 (column names)
+        if not line: continue
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 2:
+        label = parts[0]
+
+        if not label or label in ("Grand Total", "(blank)"): continue
+
+        # ─ ตรวจ market line: มี "?????" และไม่ใช่ Grand Total
+        # ตลาด 1/2/3 = "?????? ???? N"  |  หน้าร้าน = "????????"
+        if "?????" in label:
+            # นับ "?" ต่อเนื่องในส่วนแรก
+            q_count = 0
+            for ch in label.split(",")[0]:
+                if ch == "?": q_count += 1
+                else: break
+            if q_count >= 7:          # หน้าร้าน (8 ?) → หยุดรับข้อมูล
+                current_market = None
+                continue
+            # ตลาด 1/2/3
+            market_num    += 1
+            current_market = f"ตลาด {market_num}"
+            current_month  = None
             continue
-        date = _thai_date_to_gregorian(parts[0])
-        if date is None:
+
+        # ─ ตรวจ month row: ตัวเลข 1–12 ล้วน
+        if label.isdigit() and 1 <= int(label) <= 12:
+            current_month = int(label)
             continue
-        row = {"date": date}
-        for i, col in enumerate(size_cols):
-            idx = i + 1
-            if idx < len(parts) and col not in ("skip",):
-                row[col] = _safe_num(parts[idx])
-        records.append(row)
+
+        # ─ ตรวจ date row + บันทึก
+        if current_market and current_month:
+            date = parse_date(label)
+            if date:
+                records.append({
+                    "market": current_market,
+                    "month":  current_month,
+                    "kg4":  safe_int(parts[1]) if len(parts) > 1 else 0,
+                    "kg7":  safe_int(parts[2]) if len(parts) > 2 else 0,
+                    "kg15": safe_int(parts[3]) if len(parts) > 3 else 0,
+                    "kg48": safe_int(parts[4]) if len(parts) > 4 else 0,
+                })
 
     if not records:
-        raise ValueError("ไม่พบข้อมูลวันที่ที่ถูกต้องในไฟล์ CSV")
+        raise ValueError("ไม่พบข้อมูลในไฟล์ CSV — ตรวจสอบ format (ต้องเป็น Pivot-CSV ของ LIG)")
 
     df = pd.DataFrame(records)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"])
-    df["month"] = df["month"] = df["date"].dt.month
-
-    # ตรวจสอบคอลัมน์ที่ต้องการ
-    for col in ["kg4","kg7","kg15","kg48"]:
-        if col not in df.columns:
-            df[col] = 0.0
-
-    # รวมเป็นรายเดือน — ไม่มีข้อมูลตลาด ใส่ "ตลาดรวม"
-    agg = df.groupby("month")[["kg4","kg7","kg15","kg48"]].sum().reset_index()
-    agg["market"] = "ตลาดรวม"
+    agg = df.groupby(["month","market"])[["kg4","kg7","kg15","kg48"]].sum().reset_index()
     agg["month_name"] = agg["month"].map(MONTH_TH)
     return agg
 
 
-def _parse_csv_daily_with_market(file_bytes: bytes) -> pd.DataFrame:
-    """
-    รองรับ CSV ที่มีคอลัมน์ market ชัดเจน:
-      date,market,kg4,kg7,kg15,kg48
-    """
+def _parse_csv_flat(file_bytes: bytes) -> pd.DataFrame:
+    """รองรับ CSV flat: date,market,kg4,kg7,kg15,kg48"""
     df = pd.read_csv(io.BytesIO(file_bytes), encoding="utf-8-sig")
     df.columns = [c.strip() for c in df.columns]
-
-    # Map columns
     col_map = {}
     for c in df.columns:
         cl = c.lower()
-        if any(k in cl for k in ["date","วันที่","วัน"]):
-            col_map[c] = "date"
-        elif any(k in cl for k in ["market","ตลาด","สาขา"]):
-            col_map[c] = "market"
-        elif "4" in cl:  col_map[c] = "kg4"
-        elif "7" in cl:  col_map[c] = "kg7"
+        if any(k in cl for k in ["date","วันที่","วัน"]):  col_map[c] = "date"
+        elif any(k in cl for k in ["market","ตลาด"]):       col_map[c] = "market"
+        elif "4"  in cl: col_map[c] = "kg4"
+        elif "7"  in cl: col_map[c] = "kg7"
         elif "15" in cl: col_map[c] = "kg15"
         elif "48" in cl: col_map[c] = "kg48"
     df = df.rename(columns=col_map)
-
     if "date" not in df.columns:
-        raise ValueError("ไม่พบคอลัมน์ date ใน CSV")
-
+        raise ValueError("ไม่พบคอลัมน์ date")
     df["date"] = df["date"].astype(str).apply(_thai_date_to_gregorian)
     df = df.dropna(subset=["date"])
     df["month"] = df["date"].apply(lambda d: d.month)
-
     if "market" not in df.columns:
         df["market"] = "ตลาดรวม"
-
     for col in ["kg4","kg7","kg15","kg48"]:
-        if col not in df.columns:
-            df[col] = 0
-
+        if col not in df.columns: df[col] = 0
     agg = df.groupby(["month","market"])[["kg4","kg7","kg15","kg48"]].sum().reset_index()
     agg["month_name"] = agg["month"].map(MONTH_TH)
     return agg
 
 
 def parse_csv(file) -> tuple:
-    """Auto-detect CSV format และ parse"""
+    """Auto-detect และ parse CSV"""
     file_bytes = file.read()
-    text_preview = file_bytes[:500].decode("utf-8", errors="replace")
+    preview = file_bytes[:800].decode("utf-8", errors="replace")
+    first_line = preview.split("\n")[0].lower()
 
-    # ถ้า header มี "unit" หรือ "ถัง" → format รายวัน ไม่มีตลาด
-    if "unit" in text_preview.lower() or "ถัง" in text_preview:
-        return _parse_csv_daily(file_bytes), "CSV รายวัน (auto-detect ตลาดรวม)"
+    # Pivot-CSV ของ LIG: มี "unit" ใน row แรกหรือ "row labels" ใน row 2
+    if "unit" in first_line or "row labels" in preview.split("\n")[1].lower():
+        return _parse_pivot_csv(file_bytes), "CSV Pivot (LIG format)"
 
-    # ถ้ามีคำว่า market / ตลาด ใน header
-    first_line = text_preview.split("\n")[0].lower()
-    if any(k in first_line for k in ["market","ตลาด","สาขา"]):
-        return _parse_csv_daily_with_market(file_bytes), "CSV รายวัน (มีคอลัมน์ตลาด)"
-
-    # Default: ลอง parse แบบ daily ไม่มีตลาด
-    return _parse_csv_daily(file_bytes), "CSV รายวัน"
+    # Flat CSV
+    return _parse_csv_flat(file_bytes), "CSV Flat format"
 
 
 # ─── Excel Parsers (เดิม) ──────────────────────────────────────────────────────
