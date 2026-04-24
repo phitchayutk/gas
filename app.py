@@ -38,21 +38,21 @@ MONTH_TH = {
     7:"ก.ค.",8:"ส.ค.",9:"ก.ย.",10:"ต.ค.",11:"พ.ย.",12:"ธ.ค."
 }
 
-# ─── DEFAULT DATA (จากไฟล์จริง ร้านแก๊ส by day) ────────────────────────────
+# ─── BASE DATA ─ ยอดขายถังแก๊ส.xlsx (แหล่งข้อมูลหลัก — ห้ามแก้ไขโดยไม่มีไฟล์ใหม่) ────
 DEFAULT_DATA = {
     "month":  [3,4,5,6,7,8,9,10,11,12, 3,4,5,6,7,8,9,10,11,12, 3,4,5,6,7,8,9,10,11,12],
     "market": (["ตลาด 1"]*10) + (["ตลาด 2"]*10) + (["ตลาด 3"]*10),
-    "kg4":  [ 95,113,199,166,202,196,127,155,181,157,
-             252,257,324,274,330,308,369,310,167,140,
-             306,295,314,283,300,299,357,392,371,361],
-    "kg7":  [ 83, 89, 92, 86,117,101, 86,107,225,240,
-             269,266,297,266,310,275,300,304,210,195,
-             208,178,193,159,191,170,188,186,175,189],
-    "kg15": [ 767, 865, 905, 833,1120,1064, 785, 921,1123,1064,
-             1229,1128,1394,1162,1227,1023,1265,1035, 739, 798,
-             1174,1100,1101,1133,1189, 978,1124,1122,1144,1071],
-    "kg48": [ 29, 16, 42,  3,  7, 43,  2, 40, 63,117,
-             125,106,141,109,111,107,128,124,139,101,
+    "kg4":  [ 87,110,177,166,202,196,127,155,181,160,
+             237,228,270,269,329,308,369,310,171,136,
+             271,283,253,261,270,275,363,392,389,361],
+    "kg7":  [ 79, 84, 82, 86,117,101, 86,107,225,241,
+             245,236,259,251,306,275,300,304,215,190,
+             188,172,161,146,172,154,199,185,181,189],
+    "kg15": [ 715, 801, 832, 833,1120,1064, 785, 921,1123,1072,
+             1126,1001,1224,1129,1218,1023,1265,1035, 766, 771,
+             1085,1038, 932,1027,1092, 891,1165,1120,1192,1071],
+    "kg48": [ 29, 15,  6,  3,  7, 43,  2, 40, 63,117,
+             119, 89,126,104,111,107,128,124,141, 99,
                0, 19,  0, 10,  8,  0, 23, 15, 29, 20],
 }
 
@@ -258,8 +258,58 @@ def _parse_flat_excel(file_bytes: bytes) -> pd.DataFrame:
     result["month_name"] = result["month"].map(MONTH_TH)
     return result
 
+def _parse_new_flat_excel(file_bytes: bytes) -> pd.DataFrame:
+    """
+    รองรับ format ใหม่ ยอดขายถังแก๊ส.xlsx:
+      วันที่ (Timestamp พ.ศ.) | พื้นที่ขาย | kg4 | kg7 | kg15 | kg48 | total
+    พื้นที่ขาย: 'ยอดขายตลาด 1', 'ยอดขายตลาด 2', 'ยอดขายตลาด 3', 'หน้าร้าน'
+    """
+    df = pd.read_excel(io.BytesIO(file_bytes))
+    # Rename columns
+    col_map = {}
+    for c in df.columns:
+        cs = str(c).strip()
+        if "วันที่" in cs or "date" in cs.lower():         col_map[c] = "date"
+        elif "พื้นที่" in cs or "market" in cs.lower():    col_map[c] = "market_raw"
+        elif "4" in cs and "kg" in cs.lower():              col_map[c] = "kg4"
+        elif "7" in cs and "kg" in cs.lower():              col_map[c] = "kg7"
+        elif "15" in cs and "kg" in cs.lower():             col_map[c] = "kg15"
+        elif "48" in cs and "kg" in cs.lower():             col_map[c] = "kg48"
+    df = df.rename(columns=col_map)
+    if "date" not in df.columns:
+        raise ValueError("ไม่พบคอลัมน์วันที่")
+    # แปลง Timestamp พ.ศ. → ค.ศ.
+    def fix_year(d):
+        if pd.isna(d): return None
+        try:
+            ts = pd.Timestamp(d)
+            if ts.year > 2400: return ts.replace(year=ts.year - 543)
+            return ts
+        except: return None
+    df["date"]  = df["date"].apply(fix_year)
+    df = df.dropna(subset=["date"])
+    df["month"] = df["date"].apply(lambda d: d.month)
+    # clean market name
+    if "market_raw" in df.columns:
+        df["market"] = df["market_raw"].astype(str).str.replace("ยอดขาย","").str.strip()
+    else:
+        df["market"] = "ตลาดรวม"
+    # กรอง หน้าร้าน ออก (ไม่ใช่ delivery)
+    df = df[df["market"].str.contains("ตลาด")]
+    for col in ["kg4","kg7","kg15","kg48"]:
+        if col not in df.columns: df[col] = 0
+    agg = df.groupby(["month","market"])[["kg4","kg7","kg15","kg48"]].sum().reset_index()
+    agg["month_name"] = agg["month"].map(MONTH_TH)
+    return agg
+
+
 def parse_excel(file) -> tuple:
     file_bytes = file.read()
+    df_peek = pd.read_excel(io.BytesIO(file_bytes), nrows=3)
+    cols = [str(c) for c in df_peek.columns]
+    # Format ใหม่: มีคอลัมน์ "พื้นที่ขาย"
+    if any("พื้นที่" in c or "พื้นที" in c for c in cols):
+        return _parse_new_flat_excel(file_bytes), "Excel Flat (LIG ยอดขายถังแก๊ส)"
     raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
     head_str = raw.iloc[:5].to_string().lower()
     if "row labels" in head_str or "sum of" in head_str or "unit" in head_str:
@@ -269,7 +319,7 @@ def parse_excel(file) -> tuple:
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⛽ Gas Sales Monitor")
-    st.caption("บริษัท ลพบุรี อุตสาหกรรมแก๊ส จำกัด (LIG)")
+    st.caption("บริษัท ลพบุรี อุตสาหกรรมแก๊ส จำกัด (LIG) · Base: ยอดขายถังแก๊ส.xlsx")
     st.divider()
 
     st.markdown("### 📂 อัปโหลดข้อมูลใหม่")
@@ -302,7 +352,7 @@ date,market,kg4,kg7,kg15,kg48
     st.markdown('</div>', unsafe_allow_html=True)
 
     parse_error = None
-    data_source = "📦 ข้อมูล LIG จริง (Embedded จากไฟล์ต้นฉบับ)"
+    data_source = "📦 Base: ยอดขายถังแก๊ส.xlsx (ข้อมูลจริง LIG ต้นฉบับ)"
 
     if uploaded is not None:
         try:
@@ -363,7 +413,7 @@ if dff.empty:
 
 # ─── Source Badge ─────────────────────────────────────────────────────────────
 badge_color = "rgba(63,185,80,0.15)" if (uploaded and not parse_error) else "rgba(88,166,255,0.12)"
-badge_text  = f"📄 {uploaded.name}" if (uploaded and not parse_error) else "📦 ข้อมูล LIG ต้นฉบับ (Embedded)"
+badge_text  = f"📄 {uploaded.name}" if (uploaded and not parse_error) else "📦 Base: ยอดขายถังแก๊ส.xlsx (ข้อมูลจริง LIG ต้นฉบับ)"
 st.markdown(
     f'<span class="source-badge" style="background:{badge_color};'
     f'color:#58a6ff;border:1px solid rgba(88,166,255,0.3);">{badge_text}</span>',
