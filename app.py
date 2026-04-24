@@ -38,10 +38,10 @@ MONTH_TH = {
     7:"ก.ค.",8:"ส.ค.",9:"ก.ย.",10:"ต.ค.",11:"พ.ย.",12:"ธ.ค."
 }
 
-# ─── BASE DATA ─ ยอดขายถังแก๊ส.xlsx (แหล่งข้อมูลหลัก — ห้ามแก้ไขโดยไม่มีไฟล์ใหม่) ────
-# รวม ตลาด 1/2/3 และ หน้าร้าน ครบทุก channel
+# ─── BASE DATA ─ ยอดขายถังแก๊ส.xlsx (แหล่งข้อมูลหลัก) ────────────────────────
+# ครบ 4 channels: ตลาด 1/2/3 + หน้าร้าน (40 rows)
 DEFAULT_DATA = {
-    "month":  [3,4,5,6,7,8,9,10,11,12,  3,4,5,6,7,8,9,10,11,12,  3,4,5,6,7,8,9,10,11,12,  3,4,5,6,7,8,9,10,11,12],
+    "month":  [3,4,5,6,7,8,9,10,11,12, 3,4,5,6,7,8,9,10,11,12, 3,4,5,6,7,8,9,10,11,12, 3,4,5,6,7,8,9,10,11,12],
     "market": (["ตลาด 1"]*10) + (["ตลาด 2"]*10) + (["ตลาด 3"]*10) + (["หน้าร้าน"]*10),
     "kg4":  [ 87,110,177,166,202,196,127,155,181,160,
              237,228,270,269,329,308,369,310,171,136,
@@ -61,24 +61,6 @@ DEFAULT_DATA = {
                0,  0,  0,  0,  0,  0,  0,  0, 10,  0],
 }
 
-# Trip data (จำนวนวันส่งจริงต่อเดือน — จากข้อมูลรายวัน)
-DEFAULT_TRIPS = {
-    "month":  [3,4,5,6,7,8,9,10,11,12, 3,4,5,6,7,8,9,10,11,12, 3,4,5,6,7,8,9,10,11,12],
-    "market": (["ตลาด 1"]*10) + (["ตลาด 2"]*10) + (["ตลาด 3"]*10),
-    "trips":  [14,14,14,15,17,16,13,19,25,25,
-               24,22,22,23,25,24,26,24,24,23,
-               23,21,19,20,23,22,27,25,25,25],
-    "avg_per_trip": [65.0,72.1,78.4,72.5,85.1,87.8,76.9,64.4,63.7,63.6,
-                     72.0,70.6,85.4,76.2,78.6,71.4,79.3,73.9,53.9,52.0,
-                     67.1,72.0,70.8,72.2,67.0,60.0,64.8,68.5,71.6,65.6],
-}
-
-# Weekday real pattern
-DEFAULT_WEEKDAY = {
-    "day":   ["จันทร์","อังคาร","พุธ","พฤหัส","ศุกร์","เสาร์"],
-    "trips": [97, 109, 113, 101, 104, 115],
-    "avg":   [61.1, 72.7, 74.3, 71.0, 68.0, 73.0],
-}
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def _safe_num(val) -> float:
@@ -318,7 +300,8 @@ def _parse_new_flat_excel(file_bytes: bytes) -> pd.DataFrame:
         df["market"] = df["market_raw"].astype(str).str.replace("ยอดขาย","").str.strip()
     else:
         df["market"] = "ตลาดรวม"
-    # เก็บทุก channel รวมหน้าร้าน
+    # กรอง หน้าร้าน ออก (ไม่ใช่ delivery)
+    df = df[df["market"].str.contains("ตลาด")]
     for col in ["kg4","kg7","kg15","kg48"]:
         if col not in df.columns: df[col] = 0
     agg = df.groupby(["month","market"])[["kg4","kg7","kg15","kg48"]].sum().reset_index()
@@ -399,10 +382,12 @@ date,market,kg4,kg7,kg15,kg48
     st.divider()
 
     all_markets = sorted(df["market"].unique().tolist())
-    default_mkts = [m for m in all_markets if m != "หน้าร้าน"]
+    default_markets = [m for m in all_markets if m != "หน้าร้าน"]
     selected_markets = st.multiselect(
-        "ช่องทางการขาย", options=all_markets, default=default_mkts,
-        help="หน้าร้าน = ลูกค้ามาซื้อเอง (ไม่มี routing cost)"
+        "ช่องทางการขาย",
+        options=all_markets,
+        default=default_markets,
+        help="หน้าร้าน = ลูกค้ามาซื้อเองที่ร้าน (ไม่มีการส่ง)"
     )
 
     selected_size = st.selectbox(
@@ -419,12 +404,6 @@ date,market,kg4,kg7,kg15,kg48
         value=(int(min(all_months)), int(max(all_months)))
     )
 
-    st.divider()
-    st.markdown("### 🔄 Before / After")
-    improve_month = st.number_input(
-        "เดือนที่เริ่ม Improve (เม.ย. = 4)",
-        min_value=1, max_value=12, value=4
-    )
     st.divider()
     st.caption(f"📌 {data_source}")
 
@@ -515,124 +494,62 @@ with col_d:
                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
     st.plotly_chart(fig4, use_container_width=True)
 
-# ─── Before / After ───────────────────────────────────────────────────────────
-st.divider()
-before_lbl = f"Before (ก่อน {MONTH_TH.get(improve_month,'?')})"
-after_lbl  = f"After ({MONTH_TH.get(improve_month,'?')}–ปัจจุบัน)"
 
-dff["period"] = dff["month"].apply(lambda m: after_lbl if m >= improve_month else before_lbl)
-ba = dff.groupby(["period","market"])[selected_size].mean().reset_index().rename(columns={selected_size:"avg"})
 
-st.markdown(f"#### 🔄 Before vs After — จุดเริ่ม Improve: **{MONTH_TH.get(improve_month,'?')}** (เดือน {improve_month})")
-
-bdf = ba[ba["period"] == before_lbl]
-adf = ba[ba["period"] == after_lbl]
-if not bdf.empty and not adf.empty:
-    cols = st.columns(len(selected_markets))
-    for i, mkt in enumerate(sorted(selected_markets)):
-        bv = bdf[bdf["market"]==mkt]["avg"].values
-        av = adf[adf["market"]==mkt]["avg"].values
-        if len(bv)>0 and len(av)>0:
-            delta = (av[0]-bv[0])/bv[0]*100 if bv[0]>0 else 0
-            cols[i].metric(mkt, f"{av[0]:.0f} ถัง/เดือน", f"{delta:+.1f}% vs before")
-
-fig5 = px.bar(ba, x="market", y="avg", color="period", barmode="group",
-              template="plotly_dark",
-              color_discrete_map={before_lbl:"#f78166", after_lbl:"#3fb950"},
-              labels={"avg":f"เฉลี่ย {size_label} (ถัง/เดือน)","market":"ตลาด","period":"ช่วง"})
-fig5.update_layout(height=260, margin=dict(l=0,r=0,t=10,b=0),
-                   legend=dict(orientation="h",y=1.08,x=0),
-                   plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-st.plotly_chart(fig5, use_container_width=True)
 
 
 # ─── Trip Analysis ────────────────────────────────────────────────────────────
 st.divider()
-st.markdown("#### 🚚 Trip Analysis — จำนวนวันส่งและประสิทธิภาพต่อ Trip")
+st.markdown("#### 🚚 จำนวนวันส่งต่อเดือน (Trips per Month)")
 
-# โหลด trip data
-if "DEFAULT_TRIPS" in dir():
-    trip_df = pd.DataFrame(DEFAULT_TRIPS)
-else:
-    trip_df = pd.DataFrame(DEFAULT_TRIPS)
-
+# Embed trip data จากไฟล์จริง
+# Trips = delivery เท่านั้น (ตลาด 1/2/3) — หน้าร้านลูกค้ามาเอง ไม่มีวันส่ง
+TRIPS_DATA = {
+    "month":  [3,4,5,6,7,8,9,10,11,12, 3,4,5,6,7,8,9,10,11,12, 3,4,5,6,7,8,9,10,11,12],
+    "market": (["ตลาด 1"]*10) + (["ตลาด 2"]*10) + (["ตลาด 3"]*10),
+    "trips":  [14,14,14,15,17,16,13,19,25,25,
+               24,22,22,23,25,24,26,24,24,23,
+               23,21,19,20,23,22,27,25,25,25],
+}
+trip_df = pd.DataFrame(TRIPS_DATA)
 trip_df["month_name"] = trip_df["month"].map(MONTH_TH)
-trip_dff = trip_df[
-    trip_df["market"].isin([m for m in selected_markets if m != "หน้าร้าน"]) &
-    trip_df["month"].between(selected_months[0], selected_months[1])
-]
 
-if not trip_dff.empty:
-    col_t1, col_t2 = st.columns(2)
+# Filter ตามเดือนที่เลือก
+trip_filt = trip_df[trip_df["month"].between(selected_months[0], selected_months[1])]
 
-    with col_t1:
-        st.markdown(f"**จำนวน Trips/เดือน**")
-        fig_trips = px.line(
-            trip_dff.sort_values("month"), x="month_name", y="trips", color="market",
-            markers=True, color_discrete_map=color_map, template="plotly_dark",
-            labels={"trips":"จำนวน trips","month_name":"เดือน","market":"ตลาด"}
-        )
-        fig_trips.update_traces(line_width=2.5, marker_size=7)
-        fig_trips.update_layout(
-            height=260, margin=dict(l=0,r=0,t=10,b=0),
-            legend=dict(orientation="h",y=1.08,x=0),
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
-        )
-        st.plotly_chart(fig_trips, use_container_width=True)
+# ตาราง pivot: แถว = เดือน, คอลัมน์ = ตลาด
+pivot_trips = trip_filt.pivot_table(
+    index=["month","month_name"], columns="market", values="trips", aggfunc="first"
+).reset_index().sort_values("month")
+pivot_trips = pivot_trips.drop(columns="month").rename(columns={"month_name":"เดือน"})
 
-    with col_t2:
-        st.markdown(f"**เฉลี่ยถัง/Trip**")
-        fig_avg = px.bar(
-            trip_dff.sort_values("month"), x="month_name", y="avg_per_trip", color="market",
-            barmode="group", color_discrete_map=color_map, template="plotly_dark",
-            labels={"avg_per_trip":"เฉลี่ยถัง/trip","month_name":"เดือน","market":"ตลาด"}
-        )
-        fig_avg.update_layout(
-            height=260, margin=dict(l=0,r=0,t=10,b=0),
-            legend=dict(orientation="h",y=1.08,x=0),
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig_avg, use_container_width=True)
+# จัดลำดับคอลัมน์
+col_order = ["เดือน"] + [c for c in ["ตลาด 1","ตลาด 2","ตลาด 3"] if c in pivot_trips.columns]
+pivot_trips = pivot_trips[col_order].set_index("เดือน")
 
-    # Summary metrics
-    t_sum = trip_dff.groupby("market").agg(
-        total_trips=("trips","sum"),
-        avg_trip_size=("avg_per_trip","mean")
-    ).reset_index()
-    trip_cols = st.columns(len(t_sum))
-    for i, row in t_sum.iterrows():
-        trip_cols[i].metric(
-            label=row["market"],
-            value=f"{int(row['total_trips'])} trips",
-            delta=f"avg {row['avg_trip_size']:.1f} ถัง/trip"
-        )
+# แสดงตารางแบบไม่ highlight (อ่านง่ายกว่า)
+st.dataframe(
+    pivot_trips.style
+        .highlight_max(axis=0, props="background-color:#d4edda; color:#155724; font-weight:bold")
+        .highlight_min(axis=0, props="background-color:#f8d7da; color:#721c24; font-weight:bold"),
+    use_container_width=True
+)
 
-    # Weekday pattern
-    st.markdown("**📅 วันในสัปดาห์ที่ส่งบ่อยและยอดสูง (ข้อมูลจริง)**")
-    wd_df = pd.DataFrame(DEFAULT_WEEKDAY)
-    day_order_full = ["จันทร์","อังคาร","พุธ","พฤหัส","ศุกร์","เสาร์"]
-    wd_df["day"] = pd.Categorical(wd_df["day"], categories=day_order_full, ordered=True)
-    wd_df = wd_df.sort_values("day")
-    fig_wd = go.Figure()
-    fig_wd.add_trace(go.Bar(
-        name="จำนวน trips", x=wd_df["day"], y=wd_df["trips"],
-        marker_color="#58a6ff", yaxis="y"
-    ))
-    fig_wd.add_trace(go.Scatter(
-        name="เฉลี่ยถัง/trip", x=wd_df["day"], y=wd_df["avg"],
-        mode="lines+markers", line=dict(color="#3fb950",width=2.5),
-        marker=dict(size=8), yaxis="y2"
-    ))
-    fig_wd.update_layout(
-        template="plotly_dark", height=240,
-        margin=dict(l=0,r=0,t=10,b=0),
-        legend=dict(orientation="h",y=1.08,x=0),
-        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        yaxis=dict(title="จำนวน trips", titlefont=dict(color="#58a6ff")),
-        yaxis2=dict(title="เฉลี่ยถัง/trip", titlefont=dict(color="#3fb950"),
-                    overlaying="y", side="right")
-    )
-    st.plotly_chart(fig_wd, use_container_width=True)
-    st.caption("วันพุธและเสาร์มี trips และยอดสูงสุด → ควร pre-stock ก่อน 1 วัน | วันจันทร์ยอดต่ำสุด → เหมาะสำหรับ maintenance")
+# Chart trips แต่ละตลาด (หน้าร้าน display-only ไม่ filter)
+fig_trips = px.line(
+    trip_filt.sort_values("month"), x="month_name", y="trips", color="market",
+    markers=True, template="plotly_dark",
+    color_discrete_map={"ตลาด 1":"#58a6ff","ตลาด 2":"#3fb950","ตลาด 3":"#f78166"},
+    labels={"trips":"จำนวนวันส่ง (วัน)","month_name":"เดือน","market":"ช่องทาง"}
+)
+fig_trips.update_traces(line_width=2.5, marker_size=7)
+fig_trips.update_layout(
+    height=260, margin=dict(l=0,r=0,t=10,b=0),
+    legend=dict(orientation="h",y=1.08,x=0),
+    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+)
+st.plotly_chart(fig_trips, use_container_width=True)
+st.caption("Trips = จำนวนวันที่ออกส่งของแต่ละตลาด — หน้าร้านลูกค้ามาซื้อเองไม่นับเป็น trip")
 
 # ─── Weekly Heatmap ───────────────────────────────────────────────────────────
 st.divider()
