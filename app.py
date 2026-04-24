@@ -325,7 +325,7 @@ def parse_excel(file) -> tuple:
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⛽ Gas Sales Monitor")
-    st.caption("บริษัท ลพบุรี อุตสาหกรรมแก๊ส จำกัด (LIG))
+    st.caption("บริษัท ลพบุรี อุตสาหกรรมแก๊ส จำกัด (LIG)")
     st.divider()
 
     st.markdown("### 📂 อัปโหลดข้อมูลใหม่")
