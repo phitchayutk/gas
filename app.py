@@ -325,7 +325,7 @@ def parse_excel(file) -> tuple:
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## ⛽ Gas Sales Monitor")
-    st.caption("บริษัท ลพบุรี อุตสาหกรรมแก๊ส จำกัด (LIG) · Base: ยอดขายถังแก๊ส.xlsx")
+    st.caption("บริษัท ลพบุรี อุตสาหกรรมแก๊ส จำกัด (LIG))
     st.divider()
 
     st.markdown("### 📂 อัปโหลดข้อมูลใหม่")
@@ -358,7 +358,7 @@ date,market,kg4,kg7,kg15,kg48
     st.markdown('</div>', unsafe_allow_html=True)
 
     parse_error = None
-    data_source = "📦 Base: ยอดขายถังแก๊ส.xlsx (ข้อมูลจริง LIG ต้นฉบับ)"
+    data_source = "📦 Base: ยอดขายถังแก๊ส.xlsx "
 
     if uploaded is not None:
         try:
@@ -549,11 +549,11 @@ fig_trips.update_layout(
     plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
 )
 st.plotly_chart(fig_trips, use_container_width=True)
-st.caption("Trips = จำนวนวันที่ออกส่งของแต่ละตลาด — หน้าร้านลูกค้ามาซื้อเองไม่นับเป็น trip")
+st.caption("Trips = จำนวนวันที่ออกส่งของแต่ละตลาด")
 
 # ─── Weekly Heatmap ───────────────────────────────────────────────────────────
 st.divider()
-st.markdown("#### 🗓️ คาดการณ์ยอดรายวัน — Estimated (ใช้ weight factor)")
+st.markdown("#### 🗓️ คาดการณ์ยอดรายวัน — Estimated")
 day_weights = {"จันทร์":1.05,"อังคาร":0.98,"พุธ":1.10,"พฤหัส":1.02,"ศุกร์":1.08,"เสาร์":0.85,"อาทิตย์":0.75}
 day_order   = list(day_weights.keys())
 monthly_total = dff.groupby(["month","month_name"])[selected_size].sum().reset_index().sort_values("month")
@@ -607,5 +607,4 @@ with st.expander("🔍 ดูข้อมูลดิบ (Raw Data)"):
                        file_name="lig_sales_filtered.csv", mime="text/csv")
 
 st.divider()
-st.caption("⛽ Gas Sales Monitor · LIG · Streamlit + Plotly · รองรับ CSV Pivot / Flat + Excel · วันที่ พ.ศ./ค.ศ.")
 
